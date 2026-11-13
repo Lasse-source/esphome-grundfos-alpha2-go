@@ -1,0 +1,8 @@
+secrets.yaml
+.esphome/
+*.log
+*.pcap
+*.cfa
+btsnoop*
+bugreport*
+*.bin
