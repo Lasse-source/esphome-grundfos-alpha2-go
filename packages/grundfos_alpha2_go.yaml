@@ -1,0 +1,242 @@
+# Grundfos ALPHA2 GO over Bluetooth Low Energy -> ESPHome (read-only)
+#
+# Use as an ESPHome package. Required substitution:  pump_mac
+# Optional substitution:                             pump_name
+#
+# Needs an ESP32 (Bluetooth). Tested with ESPHome 2026.10.2 on a LilyGO T-Beam and an
+# ALPHA2 GO 25-75 180 (product no. 93074276). See README.md and docs/PROTOCOL.md.
+#
+# IMPORTANT: the pump only talks to paired (encrypted) clients. On the first run, press the pump's
+# Bluetooth button while the ESP tries to connect and wait for "auth complete" (without "auth fail")
+# in the log. The bond is stored in the ESP's flash.
+
+substitutions:
+  pump_name: "Grundfos ALPHA2 GO"
+
+logger:
+  logs:
+    ble_sensor: INFO        # hide every notification event
+    geni_raw: INFO          # set to DEBUG to log every raw packet from the pump
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+ble_client:
+  - mac_address: ${pump_mac}
+    id: grundfos_pump
+
+globals:
+  - id: pump_stage
+    type: int
+    initial_value: "0"
+
+sensor:
+  # Receives every answer from the pump (the only subscription to notifications), reassembles GENI
+  # frames, checks the CRC and publishes the values to the template sensors below.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: grundfos_pump
+    name: "${pump_name} Bluetooth receiver"
+    internal: true
+    service_uuid: "fe5d"
+    characteristic_uuid: "859cffd1-036e-432a-aa28-1a0085b87ba9"
+    notify: true
+    update_interval: never
+    lambda: |-
+      ESP_LOGD("geni_raw", "len=%d  %s", (int) x.size(), format_hex_pretty(x).c_str());
+      static std::vector<uint8_t> buf;
+      buf.insert(buf.end(), x.begin(), x.end());
+      if (buf.size() > 300) buf.clear();
+      while (buf.size() >= 2) {
+        if (buf[0] != 0x24) { buf.erase(buf.begin()); continue; }
+        size_t tot = (size_t) buf[1] + 4;
+        if (tot < 15 || tot > 120) { buf.erase(buf.begin()); continue; }
+        if (buf.size() < tot) break;
+        std::vector<uint8_t> f(buf.begin(), buf.begin() + tot);
+        buf.erase(buf.begin(), buf.begin() + tot);
+        uint16_t crc = 0xFFFF;
+        for (size_t i = 1; i + 2 < tot; i++) {
+          crc ^= (uint16_t) (f[i] << 8);
+          for (int k = 0; k < 8; k++)
+            crc = (crc & 0x8000) ? (uint16_t) ((crc << 1) ^ 0x1021) : (uint16_t) (crc << 1);
+        }
+        crc = (uint16_t) ~crc;
+        uint16_t rx = (uint16_t) ((f[tot - 2] << 8) | f[tot - 1]);
+        if (crc != rx) {
+          ESP_LOGW("geni", "bad checksum, frame dropped");
+          continue;
+        }
+        auto u32 = [&](size_t off) -> uint32_t {
+          return ((uint32_t) f[13 + off] << 24) | ((uint32_t) f[14 + off] << 16) |
+                 ((uint32_t) f[15 + off] << 8) | (uint32_t) f[16 + off];
+        };
+        auto flt = [&](size_t off) -> float {
+          uint32_t u = u32(off);
+          float v;
+          memcpy(&v, &u, 4);
+          return v;
+        };
+        static const uint8_t T_POWER[8] = {0x30, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x29};
+        static const uint8_t T_FLOW[8] = {0x2b, 0x00, 0x02, 0x35, 0x02, 0x00, 0x00, 0x24};
+        static const uint8_t T_COUNT[8] = {0x23, 0x00, 0x00, 0xf8, 0x02, 0x00, 0x00, 0x1c};
+        size_t plen = tot - 15;
+        if (memcmp(&f[5], T_POWER, 8) == 0 && plen >= 24) {
+          float v = flt(0), a = flt(8), p = flt(12), n = flt(20);
+          if (std::isfinite(v)) id(grundfos_voltage).publish_state(v);
+          if (std::isfinite(a)) id(grundfos_current).publish_state(a);
+          if (std::isfinite(p)) id(grundfos_power).publish_state(p);
+          if (std::isfinite(n)) id(grundfos_speed).publish_state(n);
+        } else if (memcmp(&f[5], T_FLOW, 8) == 0 && plen >= 8) {
+          float q = flt(0), h = flt(4);
+          if (std::isfinite(q)) id(grundfos_flow).publish_state(q * 3600.0f);
+          if (std::isfinite(h)) id(grundfos_head).publish_state(h * 0.0001f);
+        } else if (memcmp(&f[5], T_COUNT, 8) == 0 && plen >= 12) {
+          id(grundfos_starts).publish_state((float) u32(0));
+          id(grundfos_runtime).publish_state((float) u32(8) / 3600.0f);
+        } else {
+          ESP_LOGD("geni", "unknown response type, frame skipped");
+        }
+      }
+      return NAN;
+
+  - platform: template
+    id: grundfos_power
+    name: "${pump_name} power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    id: grundfos_voltage
+    name: "${pump_name} voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    id: grundfos_current
+    name: "${pump_name} current"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 3
+  - platform: template
+    id: grundfos_speed
+    name: "${pump_name} speed"
+    unit_of_measurement: "RPM"
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    id: grundfos_flow
+    name: "${pump_name} flow (estimated)"
+    unit_of_measurement: "m³/h"
+    state_class: measurement
+    accuracy_decimals: 2
+  - platform: template
+    id: grundfos_head
+    name: "${pump_name} head (estimated)"
+    unit_of_measurement: "m"
+    state_class: measurement
+    accuracy_decimals: 2
+  - platform: template
+    id: grundfos_starts
+    name: "${pump_name} starts"
+    state_class: total_increasing
+    accuracy_decimals: 0
+  - platform: template
+    id: grundfos_runtime
+    name: "${pump_name} operating time"
+    unit_of_measurement: "h"
+    state_class: total_increasing
+    accuracy_decimals: 1
+
+  # Energy is integrated from the power value (the pump's own kWh counter was not found in captures).
+  - platform: integration
+    name: "${pump_name} energy (calculated)"
+    sensor: grundfos_power
+    time_unit: h
+    restore: true
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters:
+      - multiply: 0.001
+
+interval:
+  # Connection sequence, same order as the Grundfos GO app (seen in a Bluetooth capture):
+  #   encryption -> enable notifications (CCCD 0x001b) -> first read -> our requests.
+  # The pump drops the link about 2 s after connecting unless it is encrypted and gets a request.
+  # Handles 0x001a (data) and 0x001b (CCCD) were read from the app's traffic; ESPHome releases the service
+  # list once connected, so they cannot be looked up at runtime. They may differ on other firmware versions.
+  - interval: 250ms
+    then:
+      - lambda: |-
+          auto *c = id(grundfos_pump);
+          if (!c->connected()) {
+            id(pump_stage) = 0;
+            return;
+          }
+          int st = id(pump_stage);
+          if (st >= 10) return;
+          id(pump_stage) = st + 1;
+          const uint16_t h = 0x001a;
+          if (st == 0) {
+            esp_err_t r = esp_ble_set_encryption(c->get_remote_bda(), ESP_BLE_SEC_ENCRYPT);
+            ESP_LOGI("geni_poll", "step 0: encryption requested (status %d)", (int) r);
+            return;
+          }
+          if (st == 1) return;  // give encryption time to complete
+          if (st == 2) {
+            uint8_t on[] = {0x01, 0x00};
+            auto rc = esp_ble_gattc_write_char_descr(c->get_gattc_if(), c->get_conn_id(), 0x001b, sizeof(on), on,
+                                                     ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+            ESP_LOGI("geni_poll", "step 2: notifications enabled (status %d)", (int) rc);
+            return;
+          }
+          uint8_t hello[] = {0x27, 0x07, 0xff, 0xf8, 0x02, 0x03, 0x94, 0x95, 0x96, 0x4f, 0x91};
+          auto s0 = esp_ble_gattc_write_char(c->get_gattc_if(), c->get_conn_id(), h, sizeof(hello),
+                                             hello, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+          int s1 = 0, s2 = 0, s3 = 0;
+          if (st == 4 || st == 6) {
+            uint8_t req_power[] = {0x27, 0x07, 0xe7, 0xf8, 0x0a, 0x03, 0x57, 0x00, 0x45, 0x8a, 0xcd};
+            uint8_t req_flow[] = {0x27, 0x07, 0xe7, 0xf8, 0x0a, 0x03, 0x5d, 0x01, 0x22, 0x62, 0x7c};
+            uint8_t req_count[] = {0x27, 0x07, 0xe7, 0xf8, 0x0a, 0x03, 0x5d, 0x00, 0x01, 0x45, 0x4c};
+            delay(30);
+            s1 = esp_ble_gattc_write_char(c->get_gattc_if(), c->get_conn_id(), h, sizeof(req_power),
+                                          req_power, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+            delay(30);
+            s2 = esp_ble_gattc_write_char(c->get_gattc_if(), c->get_conn_id(), h, sizeof(req_flow),
+                                          req_flow, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+            delay(30);
+            s3 = esp_ble_gattc_write_char(c->get_gattc_if(), c->get_conn_id(), h, sizeof(req_count),
+                                          req_count, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+          }
+          ESP_LOGI("geni_poll", "step %d sent (hello %d, power %d, flow %d, counters %d)", st, (int) s0, s1, s2, s3);
+
+  # Regular polling while connected: power block and flow/head block every 10 s
+  - interval: 10s
+    then:
+      - lambda: |-
+          auto *c = id(grundfos_pump);
+          if (!c->connected()) return;
+          const uint16_t h = 0x001a;
+          uint8_t req_power[] = {0x27, 0x07, 0xe7, 0xf8, 0x0a, 0x03, 0x57, 0x00, 0x45, 0x8a, 0xcd};
+          uint8_t req_flow[] = {0x27, 0x07, 0xe7, 0xf8, 0x0a, 0x03, 0x5d, 0x01, 0x22, 0x62, 0x7c};
+          esp_ble_gattc_write_char(c->get_gattc_if(), c->get_conn_id(), h, sizeof(req_power),
+                                   req_power, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+          delay(30);
+          esp_ble_gattc_write_char(c->get_gattc_if(), c->get_conn_id(), h, sizeof(req_flow),
+                                   req_flow, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+
+  # Counters (starts and operating time) every minute
+  - interval: 60s
+    then:
+      - lambda: |-
+          auto *c = id(grundfos_pump);
+          if (!c->connected()) return;
+          const uint16_t h = 0x001a;
+          uint8_t req_count[] = {0x27, 0x07, 0xe7, 0xf8, 0x0a, 0x03, 0x5d, 0x00, 0x01, 0x45, 0x4c};
+          esp_ble_gattc_write_char(c->get_gattc_if(), c->get_conn_id(), h, sizeof(req_count),
+                                   req_count, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);

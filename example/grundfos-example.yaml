@@ -1,0 +1,38 @@
+# Minimal example device using the package from this repository.
+
+substitutions:
+  name: grundfos-pump
+  pump_mac: "AA:BB:CC:DD:EE:FF"      # the pump's Bluetooth MAC (see README: how to find it)
+  pump_name: "Grundfos ALPHA2 GO"
+
+esphome:
+  name: ${name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+preferences:
+  flash_write_interval: 10min
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+packages:
+  # Local copy:
+  grundfos: !include ../packages/grundfos_alpha2_go.yaml
+  # ...or straight from GitHub (replace YOUR-USER):
+  # grundfos: github://YOUR-USER/esphome-grundfos-alpha2-go/packages/grundfos_alpha2_go.yaml@main
